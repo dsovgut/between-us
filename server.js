@@ -1,23 +1,34 @@
 const express = require('express');
 const http = require('http');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const path = require('path');
 const questionBank = require('./questions');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  pingTimeout: 30000,
+  pingInterval: 25000
+});
 
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Helpers ──
-const rooms = new Map();
+const rooms = new Map();              // code → room
+const sessionIndex = new Map();       // sessionToken → { roomCode, playerIndex }
+
+const ROOM_TTL_MS = 24 * 60 * 60 * 1000;   // 24h
 
 function generateCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
   for (let i = 0; i < 4; i++) code += chars[Math.floor(Math.random() * chars.length)];
   return rooms.has(code) ? generateCode() : code;
+}
+
+function generateToken() {
+  return crypto.randomUUID();
 }
 
 function shuffle(arr) {
@@ -37,59 +48,217 @@ const CATEGORIES = [
   { key: 'love',         label: 'Love',          icon: '\u{1F497}' }
 ];
 
-function generateBoard() {
-  const cards = [];
-  let id = 0;
+/**
+ * Generate two boards with NO question overlap between players.
+ * Picks 10 from each category pool, splits 5/5.
+ */
+function generateBoards() {
+  const board1 = [];
+  const board2 = [];
+  let id1 = 0;
+  let id2 = 0;
+
   for (const cat of CATEGORIES) {
     const pool = questionBank[cat.key] || [];
-    const picked = shuffle(pool).slice(0, 5);
-    for (const question of picked) {
-      cards.push({ id: id++, category: cat.key, categoryLabel: cat.label, icon: cat.icon, question });
+    const picked = shuffle(pool).slice(0, 10);
+    for (let i = 0; i < 5; i++) {
+      board1.push({
+        id: id1++, category: cat.key, categoryLabel: cat.label,
+        icon: cat.icon, question: picked[i]
+      });
+    }
+    for (let i = 5; i < 10; i++) {
+      board2.push({
+        id: id2++, category: cat.key, categoryLabel: cat.label,
+        icon: cat.icon, question: picked[i]
+      });
     }
   }
-  return shuffle(cards);
+  return [shuffle(board1), shuffle(board2)];
+}
+
+function touchRoom(room) {
+  room.lastActivity = Date.now();
+}
+
+// Periodic cleanup of stale rooms
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, room] of rooms) {
+    if (now - room.lastActivity > ROOM_TTL_MS) {
+      for (const p of room.players) {
+        if (p.sessionToken) sessionIndex.delete(p.sessionToken);
+      }
+      rooms.delete(code);
+    }
+  }
+}, 60 * 60 * 1000);
+
+// ── Client-safe views ──
+function boardForClient(board, pickedCards) {
+  return board.map(c => ({
+    id: c.id, category: c.category, categoryLabel: c.categoryLabel, icon: c.icon,
+    state: pickedCards[c.id] || null,   // 'kept' | 'skipped' | 'seen' | null
+    question: pickedCards[c.id] === 'kept' ? c.question : undefined
+  }));
+}
+
+function stateSnapshot(room, playerIndex) {
+  const snap = {
+    code: room.code,
+    playerIndex,
+    players: room.players.map(p => p ? p.name : null),
+    phase: room.phase,
+    partnerConnected: room.players[1 - playerIndex]?.connected || false
+  };
+
+  if (room.phase === 'picking') {
+    snap.board = boardForClient(room.boards[playerIndex], room.pickedCards[playerIndex]);
+    snap.myCount = room.collected[playerIndex].length;
+    snap.ready = room.ready[playerIndex];
+    snap.partnerReady = room.ready[1 - playerIndex];
+  }
+
+  if (room.phase === 'firing') {
+    const r = room.firing.currentRound;
+    snap.firing = {
+      currentRound: r,
+      currentQuestion: room.firing.currentQuestion,
+      total: room.collected[r].length,
+      revealed: room.firing.revealed,
+      asker: room.players[r].name,
+      answerer: room.players[r === 0 ? 1 : 0].name
+    };
+    if (room.firing.revealed) {
+      const q = room.collected[r][room.firing.currentQuestion];
+      snap.firing.revealedQuestion = q
+        ? { question: q.question, category: q.category, categoryLabel: q.categoryLabel }
+        : null;
+    }
+  }
+
+  return snap;
+}
+
+function startNewRound(room) {
+  const [b1, b2] = generateBoards();
+  room.boards = [b1, b2];
+  room.phase = 'picking';
+  room.collected = [[], []];
+  room.pickedCards = [{}, {}];
+  room.ready = [false, false];
+  room.firing = { currentRound: 0, currentQuestion: 0, revealed: false };
+  touchRoom(room);
+
+  for (let i = 0; i < 2; i++) {
+    const player = room.players[i];
+    if (player?.socketId) {
+      io.to(player.socketId).emit('game-started', {
+        board: boardForClient(room.boards[i], room.pickedCards[i]),
+        playerIndex: i,
+        players: room.players.map(p => p ? p.name : null)
+      });
+    }
+  }
+}
+
+function broadcastToRoom(room, event, data) {
+  for (const p of room.players) {
+    if (p?.socketId) io.to(p.socketId).emit(event, data);
+  }
 }
 
 // ── Socket.IO ──
 io.on('connection', (socket) => {
 
+  socket.on('resume-session', (token, cb) => {
+    if (!token || !sessionIndex.has(token)) {
+      return cb({ success: false });
+    }
+    const { roomCode, playerIndex } = sessionIndex.get(token);
+    const room = rooms.get(roomCode);
+    if (!room) {
+      sessionIndex.delete(token);
+      return cb({ success: false });
+    }
+
+    const player = room.players[playerIndex];
+    if (!player || player.sessionToken !== token) {
+      return cb({ success: false });
+    }
+
+    player.socketId = socket.id;
+    player.connected = true;
+    socket.join(roomCode);
+    socket.roomCode = roomCode;
+    socket.playerIndex = playerIndex;
+    socket.sessionToken = token;
+    touchRoom(room);
+
+    cb({ success: true, state: stateSnapshot(room, playerIndex) });
+
+    // Notify partner that we're back
+    const partner = room.players[1 - playerIndex];
+    if (partner?.socketId) {
+      io.to(partner.socketId).emit('partner-reconnected');
+    }
+  });
+
   socket.on('create-room', (playerName, cb) => {
     const code = generateCode();
-    rooms.set(code, {
+    const token = generateToken();
+    const room = {
       code,
-      players: [{ name: playerName, socketId: socket.id }],
+      players: [
+        { name: playerName, sessionToken: token, socketId: socket.id, connected: true },
+        null
+      ],
       phase: 'waiting',
-      board: [],
+      boards: [[], []],
       collected: [[], []],
       pickedCards: [{}, {}],
       ready: [false, false],
-      firing: { currentRound: 0, currentQuestion: 0 }
-    });
+      firing: { currentRound: 0, currentQuestion: 0, revealed: false },
+      lastActivity: Date.now()
+    };
+    rooms.set(code, room);
+    sessionIndex.set(token, { roomCode: code, playerIndex: 0 });
+
     socket.join(code);
     socket.roomCode = code;
     socket.playerIndex = 0;
-    cb({ success: true, code, playerIndex: 0 });
+    socket.sessionToken = token;
+
+    cb({ success: true, code, playerIndex: 0, sessionToken: token });
   });
 
   socket.on('join-room', ({ code: rawCode, name }, cb) => {
     const code = (rawCode || '').toUpperCase().trim();
     const room = rooms.get(code);
     if (!room) return cb({ success: false, error: 'Room not found' });
-    if (room.players.length >= 2) return cb({ success: false, error: 'Room is full' });
+    if (room.players[1]) return cb({ success: false, error: 'Room is full' });
     if (room.phase !== 'waiting') return cb({ success: false, error: 'Game already started' });
 
-    room.players.push({ name, socketId: socket.id });
+    const token = generateToken();
+    room.players[1] = { name, sessionToken: token, socketId: socket.id, connected: true };
+    sessionIndex.set(token, { roomCode: code, playerIndex: 1 });
+    touchRoom(room);
+
     socket.join(code);
     socket.roomCode = code;
     socket.playerIndex = 1;
-    cb({ success: true, code, playerIndex: 1 });
+    socket.sessionToken = token;
 
-    io.to(code).emit('lobby-update', { players: room.players.map(p => p.name) });
+    cb({ success: true, code, playerIndex: 1, sessionToken: token });
+
+    broadcastToRoom(room, 'lobby-update', {
+      players: room.players.map(p => p ? p.name : null)
+    });
   });
 
   socket.on('start-game', (cb) => {
     const room = rooms.get(socket.roomCode);
-    if (!room || room.players.length < 2 || socket.playerIndex !== 0) {
+    if (!room || !room.players[0] || !room.players[1] || socket.playerIndex !== 0) {
       return cb && cb({ success: false });
     }
     startNewRound(room);
@@ -98,16 +267,19 @@ io.on('connection', (socket) => {
 
   socket.on('flip-card', (cardId, cb) => {
     const room = rooms.get(socket.roomCode);
-    if (!room || room.phase !== 'picking') return cb({ success: false });
+    if (!room || room.phase !== 'picking') return cb && cb({ success: false });
     const pi = socket.playerIndex;
-    if (room.ready[pi]) return cb({ success: false });
-    if (room.pickedCards[pi][cardId] === 'kept') return cb({ success: false });
+    if (room.ready[pi]) return cb && cb({ success: false });
+    if (room.pickedCards[pi][cardId] === 'kept') return cb && cb({ success: false });
 
-    const card = room.board.find(c => c.id === cardId);
-    if (!card) return cb({ success: false });
+    const card = room.boards[pi].find(c => c.id === cardId);
+    if (!card) return cb && cb({ success: false });
 
-    room.pickedCards[pi][cardId] = 'seen';
-    cb({ success: true, question: card.question, category: card.category, categoryLabel: card.categoryLabel });
+    if (!room.pickedCards[pi][cardId]) {
+      room.pickedCards[pi][cardId] = 'seen';
+    }
+    touchRoom(room);
+    cb && cb({ success: true, question: card.question, category: card.category, categoryLabel: card.categoryLabel });
   });
 
   socket.on('keep-card', (cardId) => {
@@ -116,26 +288,33 @@ io.on('connection', (socket) => {
     const pi = socket.playerIndex;
     if (room.ready[pi] || room.collected[pi].length >= 5) return;
 
-    const card = room.board.find(c => c.id === cardId);
+    const card = room.boards[pi].find(c => c.id === cardId);
     if (!card || room.pickedCards[pi][cardId] === 'kept') return;
 
     room.pickedCards[pi][cardId] = 'kept';
-    room.collected[pi].push({ question: card.question, category: card.category, categoryLabel: card.categoryLabel });
+    room.collected[pi].push({
+      question: card.question,
+      category: card.category,
+      categoryLabel: card.categoryLabel
+    });
+    touchRoom(room);
     socket.emit('card-kept', { cardId, count: room.collected[pi].length });
 
     if (room.collected[pi].length >= 5) {
       room.ready[pi] = true;
       socket.emit('picking-done');
+      const partner = room.players[1 - pi];
+      if (partner?.socketId) {
+        io.to(partner.socketId).emit('partner-ready');
+      }
       if (room.ready[0] && room.ready[1]) {
         room.phase = 'firing';
-        room.firing = { currentRound: 0, currentQuestion: 0 };
-        io.to(room.code).emit('firing-start', {
+        room.firing = { currentRound: 0, currentQuestion: 0, revealed: false };
+        broadcastToRoom(room, 'firing-start', {
           asker: room.players[0].name,
           answerer: room.players[1].name,
           total: room.collected[0].length
         });
-      } else {
-        socket.emit('waiting-for-partner');
       }
     }
   });
@@ -144,7 +323,9 @@ io.on('connection', (socket) => {
     const room = rooms.get(socket.roomCode);
     if (!room || room.phase !== 'picking') return;
     const pi = socket.playerIndex;
+    if (room.pickedCards[pi][cardId] === 'kept') return;
     room.pickedCards[pi][cardId] = 'skipped';
+    touchRoom(room);
     socket.emit('card-skipped', { cardId });
   });
 
@@ -154,7 +335,11 @@ io.on('connection', (socket) => {
     const { currentRound, currentQuestion } = room.firing;
     const q = room.collected[currentRound][currentQuestion];
     if (!q) return;
-    io.to(room.code).emit('question-revealed', { question: q.question, category: q.category, categoryLabel: q.categoryLabel });
+    room.firing.revealed = true;
+    touchRoom(room);
+    broadcastToRoom(room, 'question-revealed', {
+      question: q.question, category: q.category, categoryLabel: q.categoryLabel
+    });
   });
 
   socket.on('next-question', () => {
@@ -162,8 +347,10 @@ io.on('connection', (socket) => {
     if (!room || room.phase !== 'firing') return;
 
     room.firing.currentQuestion++;
+    room.firing.revealed = false;
     const { currentRound, currentQuestion } = room.firing;
     const questions = room.collected[currentRound];
+    touchRoom(room);
 
     if (currentQuestion >= questions.length) {
       room.firing.currentRound++;
@@ -171,17 +358,17 @@ io.on('connection', (socket) => {
 
       if (room.firing.currentRound >= 2) {
         room.phase = 'done';
-        io.to(room.code).emit('game-over');
+        broadcastToRoom(room, 'game-over');
       } else {
         const r = room.firing.currentRound;
-        io.to(room.code).emit('round-switch', {
+        broadcastToRoom(room, 'round-switch', {
           asker: room.players[r].name,
           answerer: room.players[r === 0 ? 1 : 0].name,
           total: room.collected[r].length
         });
       }
     } else {
-      io.to(room.code).emit('advance-question', { index: currentQuestion, total: questions.length });
+      broadcastToRoom(room, 'advance-question', { index: currentQuestion, total: questions.length });
     }
   });
 
@@ -189,7 +376,7 @@ io.on('connection', (socket) => {
     const room = rooms.get(socket.roomCode);
     if (!room || room.phase !== 'firing') return;
     const r = room.firing.currentRound;
-    io.to(room.code).emit('round-started', {
+    broadcastToRoom(room, 'round-started', {
       asker: room.players[r].name,
       answerer: room.players[r === 0 ? 1 : 0].name,
       total: room.collected[r].length
@@ -202,32 +389,42 @@ io.on('connection', (socket) => {
     startNewRound(room);
   });
 
+  socket.on('leave-room', () => {
+    const room = rooms.get(socket.roomCode);
+    if (!room) return;
+    const pi = socket.playerIndex;
+    const player = room.players[pi];
+    if (player?.sessionToken) {
+      sessionIndex.delete(player.sessionToken);
+    }
+
+    // If other player is also gone, remove the room entirely
+    const partner = room.players[1 - pi];
+    if (!partner || (!partner.connected && !partner.sessionToken)) {
+      rooms.delete(room.code);
+    } else {
+      // Mark this player as left
+      room.players[pi] = null;
+      if (partner?.socketId) {
+        io.to(partner.socketId).emit('partner-left');
+      }
+    }
+  });
+
   socket.on('disconnect', () => {
     const room = rooms.get(socket.roomCode);
     if (!room) return;
-    const other = room.players.find(p => p.socketId !== socket.id);
-    if (other) io.to(other.socketId).emit('partner-disconnected');
-    setTimeout(() => {
-      const r = rooms.get(socket.roomCode);
-      if (!r) return;
-      const alive = r.players.some(p => io.sockets.sockets.get(p.socketId)?.connected);
-      if (!alive) rooms.delete(socket.roomCode);
-    }, 120000);
+    const pi = socket.playerIndex;
+    const player = room.players[pi];
+    if (player) {
+      player.connected = false;
+    }
+    const partner = room.players[1 - pi];
+    if (partner?.socketId) {
+      io.to(partner.socketId).emit('partner-disconnected');
+    }
+    // Room stays in memory. Cleaned up by periodic sweep if inactive.
   });
-
-  function startNewRound(room) {
-    room.board = generateBoard();
-    room.phase = 'picking';
-    room.collected = [[], []];
-    room.pickedCards = [{}, {}];
-    room.ready = [false, false];
-    room.firing = { currentRound: 0, currentQuestion: 0 };
-
-    const boardForClient = room.board.map(c => ({
-      id: c.id, category: c.category, categoryLabel: c.categoryLabel, icon: c.icon
-    }));
-    io.to(room.code).emit('game-started', { board: boardForClient, players: room.players.map(p => p.name) });
-  }
 });
 
 const PORT = process.env.PORT || 3000;
