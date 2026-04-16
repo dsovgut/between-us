@@ -123,7 +123,7 @@
         myIndex = res.playerIndex;
         saveSession(res.sessionToken);
         displayCode.textContent = roomCode;
-        lobbyPlayers.innerHTML = '<p class="lobby-player">' + name + ' (you)</p>';
+        renderLobby([name, null]);
         btnStartGame.disabled = true;
         btnStartGame.textContent = 'Start Game';
         showScreen('lobby');
@@ -166,20 +166,22 @@
   });
 
   function renderLobby(players) {
-    var html = '';
+    lobbyPlayers.innerHTML = '';
     var playerCount = 0;
     for (var i = 0; i < 2; i++) {
       var p = players[i];
+      var el = document.createElement('p');
+      el.className = 'lobby-player';
       if (p) {
         playerCount++;
-        var suffix = (i === myIndex) ? ' (you)' : '';
-        html += '<p class="lobby-player">' + p + suffix + '</p>';
+        el.textContent = p + (i === myIndex ? ' (you)' : '');
         if (i !== myIndex) partnerName = p;
       } else {
-        html += '<p class="lobby-player lobby-empty">Waiting...</p>';
+        el.classList.add('lobby-empty');
+        el.textContent = 'Waiting...';
       }
+      lobbyPlayers.appendChild(el);
     }
-    lobbyPlayers.innerHTML = html;
 
     if (myIndex === 0) {
       btnStartGame.disabled = playerCount < 2;
@@ -326,7 +328,15 @@
   }
 
   function showFiringScreen(asker, answerer, keepRevealed) {
-    firingWho.innerHTML = '<span>' + asker + '</span>, ask <span>' + answerer + '</span>:';
+    firingWho.innerHTML = '';
+    var s1 = document.createElement('span');
+    s1.textContent = asker;
+    var s2 = document.createElement('span');
+    s2.textContent = answerer;
+    firingWho.appendChild(s1);
+    firingWho.appendChild(document.createTextNode(', ask '));
+    firingWho.appendChild(s2);
+    firingWho.appendChild(document.createTextNode(':'));
     if (!keepRevealed) {
       firingCard.className = 'firing-card';
       firingCategory.textContent = '';

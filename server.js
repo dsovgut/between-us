@@ -205,12 +205,14 @@ io.on('connection', (socket) => {
   });
 
   socket.on('create-room', (playerName, cb) => {
+    const name = String(playerName || '').trim().slice(0, 20);
+    if (!name) return cb({ success: false, error: 'Name required' });
     const code = generateCode();
     const token = generateToken();
     const room = {
       code,
       players: [
-        { name: playerName, sessionToken: token, socketId: socket.id, connected: true },
+        { name, sessionToken: token, socketId: socket.id, connected: true },
         null
       ],
       phase: 'waiting',
@@ -232,8 +234,10 @@ io.on('connection', (socket) => {
     cb({ success: true, code, playerIndex: 0, sessionToken: token });
   });
 
-  socket.on('join-room', ({ code: rawCode, name }, cb) => {
-    const code = (rawCode || '').toUpperCase().trim();
+  socket.on('join-room', ({ code: rawCode, name: rawName }, cb) => {
+    const code = String(rawCode || '').toUpperCase().trim();
+    const name = String(rawName || '').trim().slice(0, 20);
+    if (!name) return cb({ success: false, error: 'Name required' });
     const room = rooms.get(code);
     if (!room) return cb({ success: false, error: 'Room not found' });
     if (room.players[1]) return cb({ success: false, error: 'Room is full' });
@@ -270,7 +274,8 @@ io.on('connection', (socket) => {
     if (!room || room.phase !== 'picking') return cb && cb({ success: false });
     const pi = socket.playerIndex;
     if (room.ready[pi]) return cb && cb({ success: false });
-    if (room.pickedCards[pi][cardId] === 'kept') return cb && cb({ success: false });
+    const status = room.pickedCards[pi][cardId];
+    if (status === 'kept' || status === 'skipped') return cb && cb({ success: false });
 
     const card = room.boards[pi].find(c => c.id === cardId);
     if (!card) return cb && cb({ success: false });
@@ -332,6 +337,9 @@ io.on('connection', (socket) => {
   socket.on('reveal-question', () => {
     const room = rooms.get(socket.roomCode);
     if (!room || room.phase !== 'firing') return;
+    // Only the asker can reveal, and only once per question
+    if (socket.playerIndex !== room.firing.currentRound) return;
+    if (room.firing.revealed) return;
     const { currentRound, currentQuestion } = room.firing;
     const q = room.collected[currentRound][currentQuestion];
     if (!q) return;
@@ -345,6 +353,9 @@ io.on('connection', (socket) => {
   socket.on('next-question', () => {
     const room = rooms.get(socket.roomCode);
     if (!room || room.phase !== 'firing') return;
+    // Only the asker can advance, and only after revealing (prevents double-click skipping)
+    if (socket.playerIndex !== room.firing.currentRound) return;
+    if (!room.firing.revealed) return;
 
     room.firing.currentQuestion++;
     room.firing.revealed = false;
@@ -375,6 +386,8 @@ io.on('connection', (socket) => {
   socket.on('continue-round', () => {
     const room = rooms.get(socket.roomCode);
     if (!room || room.phase !== 'firing') return;
+    // Only at the start of a round, before reveal
+    if (room.firing.currentQuestion !== 0 || room.firing.revealed) return;
     const r = room.firing.currentRound;
     broadcastToRoom(room, 'round-started', {
       asker: room.players[r].name,
@@ -386,6 +399,10 @@ io.on('connection', (socket) => {
   socket.on('play-again', () => {
     const room = rooms.get(socket.roomCode);
     if (!room) return;
+    // Only allowed once the previous game is finished, and only by the host
+    if (room.phase !== 'done') return;
+    if (socket.playerIndex !== 0) return;
+    if (!room.players[0] || !room.players[1]) return;
     startNewRound(room);
   });
 
@@ -398,16 +415,30 @@ io.on('connection', (socket) => {
       sessionIndex.delete(player.sessionToken);
     }
 
-    // If other player is also gone, remove the room entirely
     const partner = room.players[1 - pi];
-    if (!partner || (!partner.connected && !partner.sessionToken)) {
-      rooms.delete(room.code);
-    } else {
-      // Mark this player as left
+
+    // If we're in the lobby, just delete the slot. Past that, the game can't
+    // continue without both players, so end it for everyone.
+    if (room.phase === 'waiting') {
       room.players[pi] = null;
+      if (partner?.socketId) {
+        io.to(partner.socketId).emit('lobby-update', {
+          players: room.players.map(p => p ? p.name : null)
+        });
+      }
+      // No one left in the room? Drop it.
+      if (!room.players[0] && !room.players[1]) {
+        rooms.delete(room.code);
+      }
+    } else {
+      // End the game; partner gets notified and the room is torn down.
+      if (partner?.sessionToken) {
+        sessionIndex.delete(partner.sessionToken);
+      }
       if (partner?.socketId) {
         io.to(partner.socketId).emit('partner-left');
       }
+      rooms.delete(room.code);
     }
   });
 
